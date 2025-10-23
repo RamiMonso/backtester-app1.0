@@ -65,7 +65,7 @@ def compute_warmup_bars(indicator_name, indicator_period, rsi_method):
     if indicator_name == "RSI":
         # Wilder smoothing needs more bars to stabilize; SMA also benefits but less so
         if rsi_method == 'wilder':
-            return max(200, p * 10)        # very conservative for Wilder
+            return max(400, p * 10)        # very conservative for Wilder
         else:
             return max(120, p * 6)         # conservative for SMA warmup
     elif indicator_name == "CCI":
@@ -1187,3 +1187,4 @@ if submitted:
             st.write(f"Buy & Hold return for period: {bh_return:.2f}%")
 
 # EOF
+
