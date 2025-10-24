@@ -3,6 +3,16 @@
 # להרצה: pip install streamlit yfinance pandas numpy matplotlib
 # ואז: streamlit run backtester_streamlit_improved_with_real_indicator.py
 
+import sys
+import subprocess
+import importlib
+
+required = ["streamlit", "yfinance", "pandas", "numpy", "matplotlib"]
+for pkg in required:
+    try:
+        importlib.import_module(pkg)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", pkg])
 
 import streamlit as st
 import yfinance as yf
@@ -16,106 +26,17 @@ import math
 st.set_page_config(page_title="Indicator Backtester — Improved (real-indicator option)", layout="wide")
 
 # ------------------------
-# Helper: robust column normalization
-# ------------------------
-def normalize_df_columns(df):
-    """
-    Robustly detect important columns (Open/High/Low/Close/Adj Close/Volume) even if column names are tuples or not pure strings.
-    Returns a copy of df with standardized column names where found and coerced numeric values.
-    """
-    if not isinstance(df, pd.DataFrame):
-        raise ValueError("normalize_df_columns expects a DataFrame")
-
-    df = df.copy()
-    # Build mapping from normalized key (no spaces, lower) to original column
-    col_map = {}
-    for c in df.columns:
-        try:
-            key = str(c).lower().replace(" ", "").replace("_", "").replace("-", "")
-        except Exception:
-            key = repr(c).lower()
-        col_map[key] = c
-
-    # helper to find column by keywords
-    def find_col(possible_names):
-        for name in possible_names:
-            name_norm = name.lower().replace(" ", "").replace("_", "").replace("-", "")
-            # exact contains
-            for k, orig in col_map.items():
-                if name_norm in k:
-                    return orig
-        return None
-
-    # Candidates for standard names
-    found_open = find_col(["open", "o"])
-    found_high = find_col(["high", "h"])
-    found_low = find_col(["low", "l"])
-    found_close = find_col(["adjclose", "adj_close", "adjclose", "adjclose", "close", "c"])
-    # prefer exact 'adj' presence to detect Adj Close
-    if found_close:
-        # if found_close contains 'adj' in its normalized form, treat as Adj Close
-        if 'adj' in str(found_close).lower().replace(" ", ""):
-            found_adj_close = found_close
-            # try to find a plain close too
-            maybe_close = find_col(["close"])
-            if maybe_close and maybe_close != found_adj_close:
-                found_close = maybe_close
-            else:
-                found_close = found_adj_close
-        else:
-            # see if there's separate adj close
-            maybe_adj = None
-            for k, orig in col_map.items():
-                if 'adj' in k and 'close' in k:
-                    maybe_adj = orig
-                    break
-            found_adj_close = maybe_adj
-
-    else:
-        found_close = find_col(["close"])
-        found_adj_close = find_col(["adjclose", "adj_close", "adj", "adjustedclose"])
-
-    found_volume = find_col(["volume", "vol"])
-
-    # Prepare renames: we will create standard column names only for ones we found
-    rename_map = {}
-    if found_open is not None:
-        rename_map[found_open] = "Open"
-    if found_high is not None:
-        rename_map[found_high] = "High"
-    if found_low is not None:
-        rename_map[found_low] = "Low"
-    if found_close is not None:
-        rename_map[found_close] = "Close"
-    if found_adj_close is not None:
-        rename_map[found_adj_close] = "Adj Close"
-    if found_volume is not None:
-        rename_map[found_volume] = "Volume"
-
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # Coerce numeric for key price columns that exist
-    for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if c in df.columns:
-            df[c] = ensure_numeric_series(df[c], index=df.index)
-
-    return df
-
-# ------------------------
-# Safe numeric coercion helper (prevents TypeError on weird column types)
+# Utility: robust numeric coercion and column normalization
 # ------------------------
 def ensure_numeric_series(x, index=None):
     """
     Convert x into pd.Series of floats aligned to index if provided.
     Robust to: Series with list cells, DataFrame columns, arrays, lists, scalars.
     """
-    # If DataFrame with one column -> pick that column
     if isinstance(x, pd.DataFrame):
         if x.shape[1] == 1:
             x = x.iloc[:, 0]
         else:
-            # try to find first numeric-like column
             for c in x.columns:
                 try:
                     s = pd.to_numeric(x[c], errors='coerce')
@@ -127,7 +48,6 @@ def ensure_numeric_series(x, index=None):
             else:
                 x = x.iloc[:, 0]
 
-    # If Series
     if isinstance(x, pd.Series):
         try:
             return pd.to_numeric(x, errors='coerce').astype(float)
@@ -154,7 +74,6 @@ def ensure_numeric_series(x, index=None):
                         coerced.append(np.nan)
                 return pd.Series(coerced, index=x.index, dtype=float)
 
-    # If array-like
     if isinstance(x, (list, tuple, np.ndarray)):
         try:
             s = pd.Series(x, index=index) if (index is not None and len(x) == len(index)) else pd.Series(x)
@@ -170,7 +89,6 @@ def ensure_numeric_series(x, index=None):
                 return pd.Series(coerced, index=index, dtype=float)
             return pd.Series(coerced, dtype=float)
 
-    # scalar fallback
     try:
         val = float(x)
         if index is not None:
@@ -180,11 +98,68 @@ def ensure_numeric_series(x, index=None):
         length = len(index) if index is not None else 1
         return pd.Series([np.nan] * length, index=index if index is not None else None, dtype=float)
 
+
+def normalize_df_columns(df):
+    """
+    Robustly detect important columns (Open/High/Low/Close/Adj Close/Volume), rename them consistently and coerce numeric.
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise ValueError("normalize_df_columns expects a DataFrame")
+    df = df.copy()
+    col_map = {}
+    for c in df.columns:
+        try:
+            key = str(c).lower().replace(" ", "").replace("_", "").replace("-", "")
+        except Exception:
+            key = repr(c).lower()
+        col_map[key] = c
+
+    def find_col(possible_names):
+        for name in possible_names:
+            name_norm = name.lower().replace(" ", "").replace("_", "").replace("-", "")
+            for k, orig in col_map.items():
+                if name_norm in k:
+                    return orig
+        return None
+
+    found_open = find_col(["open", "o"])
+    found_high = find_col(["high", "h"])
+    found_low = find_col(["low", "l"])
+    found_close = find_col(["adjclose", "adj_close", "adj", "close", "c"])
+    found_adj_close = None
+    for k, orig in col_map.items():
+        if 'adj' in k and 'close' in k:
+            found_adj_close = orig
+            break
+    found_volume = find_col(["volume", "vol"])
+
+    rename_map = {}
+    if found_open is not None:
+        rename_map[found_open] = "Open"
+    if found_high is not None:
+        rename_map[found_high] = "High"
+    if found_low is not None:
+        rename_map[found_low] = "Low"
+    if found_close is not None:
+        rename_map[found_close] = "Close"
+    if found_adj_close is not None:
+        rename_map[found_adj_close] = "Adj Close"
+    if found_volume is not None:
+        rename_map[found_volume] = "Volume"
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if c in df.columns:
+            df[c] = ensure_numeric_series(df[c], index=df.index)
+    return df
+
 # ------------------------
-# Indicator implementations
+# Indicators
 # ------------------------
 def ema(series, period):
-    s = ensure_numeric_series(series)
+    s = ensure_numeric_series(series, index=series.index if isinstance(series, pd.Series) else None)
     return s.ewm(span=period, adjust=False).mean()
 
 def macd(df, fast=12, slow=26, signal=9):
@@ -194,7 +169,7 @@ def macd(df, fast=12, slow=26, signal=9):
     return macd_line, signal_line, hist
 
 def rsi(series, period=14, method='sma'):
-    s = ensure_numeric_series(series)
+    s = ensure_numeric_series(series, index=series.index if isinstance(series, pd.Series) else None)
     delta = s.diff()
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
@@ -210,9 +185,9 @@ def rsi(series, period=14, method='sma'):
     return rsi_v
 
 def cci(df, period=20):
-    close = ensure_numeric_series(df['Close'])
-    high = ensure_numeric_series(df['High'])
-    low = ensure_numeric_series(df['Low'])
+    close = ensure_numeric_series(df['Close'], index=df.index)
+    high = ensure_numeric_series(df['High'], index=df.index)
+    low = ensure_numeric_series(df['Low'], index=df.index)
     tp = (high + low + close) / 3
     sma_tp = tp.rolling(window=period).mean()
     mad = tp.rolling(window=period).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
@@ -246,7 +221,7 @@ def compute_warmup_days(warmup_bars, interval):
         return max(days, 30)
 
 # ------------------------
-# Utilities & Backtest core (kept largely as in your original code)
+# Utilities & Backtest core
 # ------------------------
 def _to_scalar_safe(x):
     if x is None:
@@ -297,11 +272,6 @@ def _get_indicator_value_at(indicator_series, idx):
         return float(val)
     except Exception:
         return np.nan
-
-# (run_backtest function preserved — identical to earlier robust version)
-# For brevity here we reuse the same run_backtest implementation you had — keep it unchanged
-# Insert the run_backtest implementation from your working version here.
-# For clarity and to ensure a self-contained file, the full function is included below:
 
 def run_backtest(df, indicator_series, low_thresh, high_thresh,
                  entry_exec='close', exit_exec='close',
@@ -394,7 +364,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
             if entry_exec == 'close':
                 entry_price_raw = df['Close'].iloc[i]
             else:  # next_open
-                entry_price_raw = df['Open'].iloc[i + 1] if (i + 1) < len(df) else None
+                entry_price_raw = df['next_open'].iloc[i] if 'next_open' in df.columns else (df['Open'].iloc[i + 1] if (i + 1) < len(df) else None)
 
             try:
                 entry_price = float(entry_price_raw) if entry_price_raw is not None else None
@@ -481,7 +451,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
             if exit_exec == 'close':
                 exit_price_raw = df['Close'].iloc[i]
             else:
-                exit_price_raw = df['Open'].iloc[i + 1] if (i + 1) < len(df) else None
+                exit_price_raw = df['next_open'].iloc[i] if 'next_open' in df.columns else (df['Open'].iloc[i + 1] if (i + 1) < len(df) else None)
             try:
                 exit_price = float(exit_price_raw) if exit_price_raw is not None else None
             except Exception:
@@ -755,18 +725,22 @@ if submitted:
             st.error("לא הצלחנו לקבל טווח נתונים תקין מ-Yahoo. נסה לשנות טווח/תדירות או כבה את 'נתוני אמת'.")
             st.stop()
 
-        # Normalize columns robustly
+        try:
+            df_full.index = pd.to_datetime(df_full.index)
+        except Exception:
+            pass
+
+        # normalize and coerce numeric
         try:
             df_full = normalize_df_columns(df_full)
         except Exception:
-            # If normalization fails, still try to coerce main columns
             for c in df_full.columns:
                 try:
                     df_full[c] = ensure_numeric_series(df_full[c], index=df_full.index)
                 except Exception:
                     pass
 
-        # Compute indicators locally (fallback)
+        # compute computed indicators on full df
         if indicator == "RSI":
             ind_computed = rsi(df_full['Close'], period=int(indicator_period), method=rsi_method) if 'Close' in df_full.columns else pd.Series([np.nan]*len(df_full), index=df_full.index)
         elif indicator == "CCI":
@@ -778,156 +752,6 @@ if submitted:
             else:
                 ind_computed = pd.Series([np.nan]*len(df_full), index=df_full.index)
 
-        # Build indicator series according to user's selection:
-        ind_full_series = None
-        used_real_source = None
+        # prepare indicator series (uploaded CSV or df column
 
-        # If user uploaded CSV and requested real indicators -> try to parse
-        if use_real_indicators and (uploaded_indicator_file is not None):
-            try:
-                file_bytes = uploaded_indicator_file.read()
-                try:
-                    content = file_bytes.decode('utf-8')
-                except Exception:
-                    content = file_bytes.decode('latin1')
-                csv_df = pd.read_csv(StringIO(content))
-                col_date = None
-                col_ind = None
-                for c in csv_df.columns:
-                    if 'date' in str(c).lower() or 'time' in str(c).lower() or 'datetime' in str(c).lower():
-                        col_date = c
-                        break
-                for c in csv_df.columns:
-                    if c == col_date:
-                        continue
-                    if indicator.lower() in str(c).lower() or 'indicator' in str(c).lower() or 'value' in str(c).lower():
-                        col_ind = c
-                        break
-                if col_date is None:
-                    st.warning("לא זוהתה עמודת תאריך בקובץ ה-CSV. נסה להעלות קובץ עם עמודת תאריך.")
-                else:
-                    csv_df[col_date] = pd.to_datetime(csv_df[col_date])
-                    csv_df = csv_df.set_index(col_date).sort_index()
-                    if col_ind is None:
-                        for c in csv_df.columns:
-                            try:
-                                tmp = pd.to_numeric(csv_df[c], errors='coerce')
-                                if tmp.notna().any():
-                                    col_ind = c
-                                    break
-                            except Exception:
-                                continue
-                    if col_ind is not None:
-                        tmp_series = ensure_numeric_series(csv_df[col_ind], index=csv_df.index)
-                        aligned = tmp_series.reindex(df_full.index)
-                        nan_ratio = aligned.isna().mean()
-                        if nan_ratio > 0.5:
-                            try:
-                                if interval == "1d":
-                                    aligned_nearest = tmp_series.reindex(df_full.index, method='nearest', tolerance=pd.Timedelta(days=1))
-                                else:
-                                    aligned_nearest = tmp_series.reindex(df_full.index, method='nearest', tolerance=pd.Timedelta(hours=2))
-                                ind_full_series = aligned_nearest
-                            except Exception:
-                                ind_full_series = aligned
-                        else:
-                            ind_full_series = aligned
-                        used_real_source = "uploaded_csv"
-            except Exception as e:
-                st.warning(f"שגיאה בקריאת ה-CSV: {e} - נמשיך לנסות מקורות אחרים או שימוש במחשוב פנימי.")
-
-        # If not yet found and user requested real indicators, try to find a column in df_full
-        if ind_full_series is None and use_real_indicators:
-            found_col = None
-            for c in df_full.columns:
-                lc = str(c).lower()
-                if indicator.lower() == "rsi" and 'rsi' in lc:
-                    found_col = c; break
-                if indicator.lower() == "cci" and 'cci' in lc:
-                    found_col = c; break
-                if indicator.lower() == "macd" and 'macd' in lc and 'hist' not in lc:
-                    found_col = c; break
-            if found_col:
-                try:
-                    ind_full_series = ensure_numeric_series(df_full[found_col], index=df_full.index)
-                    used_real_source = f"df_full_col:{found_col}"
-                except Exception:
-                    ind_full_series = None
-
-        # fallback to computed indicator
-        if ind_full_series is None:
-            ind_full_series = ensure_numeric_series(ind_computed, index=df_full.index)
-            used_real_source = "computed"
-
-        try:
-            ind_full_series = pd.to_numeric(ind_full_series, errors='coerce')
-        except Exception:
-            ind_full_series = ensure_numeric_series(ind_full_series, index=df_full.index)
-
-        # Trim to requested window for running the actual backtest (entries limited to that window)
-        start_ts = pd.to_datetime(start_date)
-        end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1)
-        df = df_full.loc[start_ts:end_ts].copy()
-        ind_series = ind_full_series.reindex(df.index).copy()
-
-        if df.empty:
-            st.error("לא נותרו ברים בטווח שנבחר אחרי חיתוך ה-warmup — בדוק את תאריכי התחלה/סיום.")
-            st.stop()
-
-        if debug_mode:
-            st.subheader("Debug - indicator head and first threshold hits")
-            st.write(f"Indicator source used: {used_real_source}")
-            try:
-                st.write(ind_series.head(20))
-            except Exception:
-                pass
-
-        # Ensure next_open column for next_open execution logic (we'll shift Open to align next_open)
-        if 'Open' in df.columns:
-            df['next_open'] = df['Open'].shift(-1)
-        else:
-            df['next_open'] = np.nan
-
-        # Run backtest using ind_series and df
-        trades_df, baseline_summary, equity_curve, open_positions, debug_log = run_backtest(
-            df, ind_series, low_thresh, high_thresh,
-            entry_exec=entry_exec, exit_exec=exit_exec,
-            sizing_mode=sizing_mode, fixed_amount=fixed_amount,
-            initial_capital=initial_capital,
-            allow_multiple_entries=allow_multiple_entries,
-            commission_mode=commission_mode, commission_value=commission_value,
-            exclude_incomplete=exclude_incomplete,
-            defer_until_next_cross_with_price_higher=defer_until_next_cross_with_price_higher,
-            debug_mode=debug_mode
-        )
-
-        # ... (rest of post-period processing, table building and plotting as in prior version) ...
-        # For brevity, reuse the same robust post-period and UI rendering logic you had previously,
-        # making sure to reference df_full and df safely (they are normalized above).
-        # (To keep this single-file complete, paste the post-period handling and UI output code
-        #  from your previous working version here unchanged, using the variables created above:
-        #  trades_df, baseline_summary, equity_curve, open_positions, ind_full_series, df_full, df, etc.)
-
-        # NOTE: to keep this response focused on the reported AttributeError fix,
-        # I have shown the full critical sections and ensured normalization is applied
-        # before any use of df_full.columns or .lower(). If you want, I can paste the
-        # rest of the UI output (tables/plots/downloads) exactly as in your previous
-        # implementation — or you can reuse what's already in your file after this point.
-
-        # For now, show minimal summary and first rows to confirm things run:
-        st.subheader("תוצאות Backtest - תקציר")
-        st.json(baseline_summary)
-        st.write("דגימת ברים ראשונים (מחיר + אינדיקטור):")
-        sample = pd.DataFrame({
-            'Close': df['Close'].head(10) if 'Close' in df.columns else pd.Series([np.nan]*10, index=df.index[:10]),
-            'Indicator': ind_series.head(10)
-        })
-        st.dataframe(sample)
-
-        if debug_mode and debug_log:
-            st.subheader("Debug log")
-            for ln in debug_log[:300]:
-                st.text(ln)
-
-# EOF
 
