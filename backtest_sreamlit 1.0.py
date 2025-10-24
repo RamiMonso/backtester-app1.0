@@ -654,6 +654,67 @@ def fetch_data(ticker, start_date, end_date, interval):
     return df
 
 # ------------------------
+# Helper: find & normalize price columns
+# ------------------------
+def find_column_like(df, names):
+    """
+    return the actual column name in df that matches any name in 'names' (case-insensitive),
+    or None if not found.
+    """
+    low_map = {str(c).lower(): c for c in df.columns}
+    for n in names:
+        key = n.lower()
+        if key in low_map:
+            return low_map[key]
+    # fallback: try partial contains
+    for col in df.columns:
+        lc = str(col).lower()
+        for n in names:
+            if n.lower() in lc:
+                return col
+    return None
+
+def normalize_price_columns(df):
+    """
+    Ensure df has standardized columns: 'Open','High','Low','Close','Adj Close','Volume'
+    Returns df with those columns (converted to numeric) if possible. Raises ValueError if Close missing.
+    """
+    df = df.copy()
+    # ensure column names are strings
+    df.columns = [str(c) for c in df.columns]
+
+    # candidates
+    open_col = find_column_like(df, ['open'])
+    high_col = find_column_like(df, ['high'])
+    low_col = find_column_like(df, ['low'])
+    close_col = find_column_like(df, ['close'])
+    adj_col = find_column_like(df, ['adj close', 'adjusted close', 'adjclose'])
+    vol_col = find_column_like(df, ['volume'])
+
+    # If close not found but adj found -> use adj as close (we'll still keep adj separately)
+    if close_col is None and adj_col is not None:
+        close_col = adj_col
+
+    # If still no close -> cannot proceed
+    if close_col is None:
+        raise ValueError("לא נמצאה עמודת 'Close' או 'Adj Close' בנתוני yfinance — לא ניתן להמשיך.")
+
+    # Create standardized columns by coercing numeric
+    if open_col is not None:
+        df['Open'] = ensure_numeric_series(df[open_col], index=df.index)
+    if high_col is not None:
+        df['High'] = ensure_numeric_series(df[high_col], index=df.index)
+    if low_col is not None:
+        df['Low'] = ensure_numeric_series(df[low_col], index=df.index)
+    df['Close'] = ensure_numeric_series(df[close_col], index=df.index)
+    if adj_col is not None:
+        df['Adj Close'] = ensure_numeric_series(df[adj_col], index=df.index)
+    if vol_col is not None:
+        df['Volume'] = ensure_numeric_series(df[vol_col], index=df.index)
+
+    return df
+
+# ------------------------
 # Main execution
 # ------------------------
 if submitted:
@@ -675,16 +736,23 @@ if submitted:
             st.error("לא הצלחנו לקבל נתונים תקינים מ-Yahoo לנתונים מלאים. ודא חיבור אינטרנט וסימון נכון של טיקר/טווח.")
             st.stop()
 
-        # normalize index & ensure column names are strings
+        # normalize index
         try:
             df_full.index = pd.to_datetime(df_full.index)
         except Exception:
             pass
-        df_full.columns = [str(c) for c in df_full.columns]
+
+        # Normalize price columns and coerce numeric
+        try:
+            df_full = normalize_price_columns(df_full)
+        except Exception as e:
+            st.error(f"שגיאה במיפוי עמודות המחיר: {e}")
+            st.stop()
 
         # If user requested "use real indicators", do NOT apply AdjFactor to prices (we want raw chart values).
-        # Otherwise, you may choose to apply Adj Close adjustments if you previously did so.
+        # Otherwise, optionally apply adjustment factor if available
         if not use_real_indicators:
+            # if Adj Close exists and Close exists, compute adj factor and adjust OHLC
             if 'Adj Close' in df_full.columns and df_full['Close'].notna().any():
                 with np.errstate(divide='ignore', invalid='ignore'):
                     adjf = (df_full['Adj Close'] / df_full['Close']).replace([np.inf, -np.inf], np.nan)
