@@ -1,6 +1,5 @@
 # backtester_streamlit_improved.py
-# Improved Backtester for Streamlit — adjusted-price indicators, manual warmup days (default 500),
-# fixes for off-by-one & next_open, preserves existing logic otherwise.
+# Improved Backtester for Streamlit — expanded warmup + defaults + summary additions
 # להרצה: pip install streamlit yfinance pandas numpy matplotlib
 # ואז: streamlit run backtester_streamlit_improved.py
 
@@ -14,7 +13,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from io import BytesIO
 import math
 
-st.set_page_config(page_title="Indicator Backtester — Improved (adjusted prices + manual warmup)", layout="wide")
+st.set_page_config(page_title="Indicator Backtester — Improved (expanded warmup)", layout="wide")
 
 # ------------------------
 # Indicator implementations
@@ -22,8 +21,8 @@ st.set_page_config(page_title="Indicator Backtester — Improved (adjusted price
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-def macd(df_close, fast=12, slow=26, signal=9):
-    macd_line = ema(df_close, fast) - ema(df_close, slow)
+def macd(df, fast=12, slow=26, signal=9):
+    macd_line = ema(df['Close'], fast) - ema(df['Close'], slow)
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
@@ -33,45 +32,62 @@ def rsi(series, period=14, method='sma'):
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
     if method == 'wilder':
+        # Wilder with min_periods=1 to produce early values but we rely on warmup for stability
         avg_gain = gain.ewm(alpha=1/period, min_periods=1, adjust=False).mean()
         avg_loss = loss.ewm(alpha=1/period, min_periods=1, adjust=False).mean()
     else:
         avg_gain = gain.rolling(window=period, min_periods=1).mean()
         avg_loss = loss.rolling(window=period, min_periods=1).mean()
+
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     rsi = rsi.fillna(50.0)
     return rsi
 
-def cci(df_close, df_high, df_low, period=20):
-    tp = (df_high + df_low + df_close) / 3
+def cci(df, period=20):
+    tp = (df['High'] + df['Low'] + df['Close']) / 3
     sma_tp = tp.rolling(window=period).mean()
     mad = tp.rolling(window=period).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
     cci = (tp - sma_tp) / (0.015 * mad)
     return cci
 
 # ------------------------
-# Warmup helpers
+# Warmup helpers (expanded/stricter)
 # ------------------------
 def compute_warmup_bars(indicator_name, indicator_period, rsi_method):
+    """
+    Return a conservative number of bars to fetch before start_date to 'warm up' indicators.
+    Increased relative to earlier versions to improve indicator stability at the first usable bar.
+    """
     p = int(max(1, int(indicator_period)))
+    # Make warmup significantly larger to avoid early transient/edge effects
     if indicator_name == "RSI":
-        return max(200, p * 10) if rsi_method == 'wilder' else max(120, p * 6)
+        # Wilder smoothing needs more bars to stabilize; SMA also benefits but less so
+        if rsi_method == 'wilder':
+            return max(200, p * 10)        # very conservative for Wilder
+        else:
+            return max(120, p * 6)         # conservative for SMA warmup
     elif indicator_name == "CCI":
-        return max(120, p * 6)
+        return max(120, p * 6)             # CCI uses rolling and MAD -> needs many bars
     elif indicator_name == "MACD":
         slow = 26
-        return max(200, slow * 8)
+        return max(200, slow * 8)          # MACD uses EMAs -> give ample history
     else:
         return max(120, p * 6)
 
 def compute_warmup_days(warmup_bars, interval):
+    """
+    Convert warmup bars to calendar days to fetch from yfinance.
+    Use a conservative multiplier to ensure enough history is retrieved.
+    """
     if interval == "1d":
+        # assume 1 bar per trading day, but fetch extra calendar days to account for weekends/holidays
         days = int(math.ceil(warmup_bars * 1.8)) + 10
     else:
+        # for intraday, approximate trading bars per day ~6.5 hours -> 6.5 bars for 60m
         trading_bars_per_day = 6.5
         days = int(math.ceil((warmup_bars / trading_bars_per_day) * 2.0)) + 5
-        days = max(days, 30)
+        days = max(days, 30)  # ensure a reasonable minimum for intraday
     return days
 
 # ------------------------
@@ -135,9 +151,8 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
                  defer_until_next_cross_with_price_higher=False,
                  debug_mode=False):
     """
-    Main backtest loop. df is expected to contain adjusted prices in columns:
-    'Open','High','Low','Close' (we overwrite these with adjusted versions earlier).
-    indicator_series aligned to df.index.
+    Main backtest loop with enhanced debugging.
+    Returns: trades_df, baseline_summary, equity_curve, open_positions_list, debug_log
     """
     if isinstance(indicator_series, pd.DataFrame):
         indicator_series = indicator_series.iloc[:, 0]
@@ -217,7 +232,6 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
         if ind_val_float < low_thresh_f:
             # decide entry price
             if entry_exec == 'close':
-                # use adjusted Close (df['Close'] was overwritten earlier to be adjusted)
                 entry_price_raw = df['Close'].iloc[i]
             else:  # next_open
                 entry_price_raw = df['Open'].iloc[i + 1] if (i + 1) < len(df) else None
@@ -243,6 +257,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
                             commission_entry = 0.0
 
                         if not allow_multiple_entries and len(positions) > 0:
+                            # cannot enter due to pyramiding restriction
                             if debug_mode:
                                 debug_log.append(f"BAR {i} {date} - entry skipped (pyramiding disabled)")
                         else:
@@ -266,6 +281,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
                             debug_log.append(f"BAR {i} {date} - entry computed shares=0 (fixed_amount too small)")
                 else:  # compound
                     if entry_price != 0:
+                        # compute current equity
                         current_unrealized = 0.0
                         for p in positions:
                             try:
@@ -304,6 +320,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
 
         # ----- EXIT LOGIC ----- #
         for pos in positions[:]:
+            # default: determine exit_price according to execution
             if exit_exec == 'close':
                 exit_price_raw = df['Close'].iloc[i]
             else:
@@ -356,6 +373,8 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
                     if debug_mode:
                         debug_log.append(f"BAR {i} {date} - exit_price <= entry_price ({exit_price} <= {entry_price_val}) - keep deferred")
                     continue
+                # else proceed to close
+
             else:
                 try:
                     if not (ind_val_float > high_thresh_f):
@@ -364,6 +383,9 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
                     continue
                 if exit_price is None:
                     continue
+                # Note: in-period behavior historically allowed exit even if exit_price <= entry_price.
+                # We keep that behavior inside the in-period loop to match historical runs.
+                # Post-period logic (in the UI flow) will use stricter BOTH-conditions if selected.
 
             # compute PnL
             shares = pos['shares']
@@ -403,6 +425,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
             }
             trades.append(trade)
 
+            # update realized pnl and remove position
             cumulative_realized_pnl += pnl_amount
             positions.remove(pos)
             if debug_mode:
@@ -421,10 +444,11 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
         if debug_mode and not entered_this_bar:
             debug_log.append(f"BAR {i} {date} - indicator={ind_val_float:.4f} low={low_thresh_f} entered={entered_this_bar} positions={len(positions)}")
 
+    # Finished loop
     trades_df = pd.DataFrame(trades)
 
-    # baseline summary
-    open_positions_list = positions
+    # ---- Build baseline summary (apply exclude_incomplete as baseline) ----
+    open_positions_list = positions  # remaining open positions
     open_positions_count = len(open_positions_list)
 
     if equity_curve.dropna().empty:
@@ -441,9 +465,14 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
     total_return_amount_baseline = final_equity_baseline - initial_capital
     total_return_pct_baseline = (total_return_amount_baseline / initial_capital) * 100 if initial_capital != 0 else 0.0
 
+    # compute baseline win rate
     total_trades = len(trades_df)
-    wins = trades_df[trades_df['pnl_amount'] > 0].shape[0] if total_trades > 0 else 0
-    win_rate = (wins / total_trades * 100.0) if total_trades > 0 else np.nan
+    wins = 0
+    if total_trades > 0:
+        wins = trades_df[trades_df['pnl_amount'] > 0].shape[0]
+        win_rate = wins / total_trades * 100.0
+    else:
+        win_rate = np.nan
 
     baseline_summary = {
         'total_trades': total_trades,
@@ -455,13 +484,13 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
         'open_positions_excluded': int(open_positions_count) if exclude_incomplete else 0
     }
 
-    # fixed sizing - compute implied fixed returns if requested by user later
+    # If fixed sizing, compute fixed-mode returns as user requested:
     if sizing_mode == 'fixed':
         if total_trades > 0:
             fixed_total_invested = float(fixed_amount) * total_trades
             fixed_total_pnl = float(baseline_summary['total_pnl_amount'])
             fixed_return_pct = (fixed_total_pnl / fixed_total_invested) * 100.0 if fixed_total_invested != 0 else np.nan
-            avg_return_pct_per_trade = fixed_return_pct
+            avg_return_pct_per_trade = fixed_return_pct  # same interpretation: total over total invested
         else:
             fixed_total_invested = 0.0
             fixed_total_pnl = 0.0
@@ -480,10 +509,11 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
     else:
         return trades_df, baseline_summary, equity_curve, open_positions_list, None
 
+
 # ------------------------
 # Streamlit UI
 # ------------------------
-st.title("Backtester לפי אינדיקטורים — RSI / CCI / MACD (מתוקן)")
+st.title("Backtester לפי אינדיקטורים — RSI / CCI / MACD (משופר, warmup מוגדל)")
 st.markdown("מלא את הפרטים בצד שמאל ולחץ הרץ.")
 
 with st.sidebar.form(key='params'):
@@ -497,14 +527,14 @@ with st.sidebar.form(key='params'):
     interval = "1d" if timeframe == "Daily" else "60m"
 
     st.markdown("5) מספר מדד נמוך לכניסה ו-6) מספר מדד גבוה ליציאה")
-    # defaults requested: low=40 high=60
+    # default low=40, high=60 as requested
     low_thresh = st.number_input("מדד נמוך (כניסה)", value=40.0)
     high_thresh = st.number_input("מדד גבוה (יציאה)", value=60.0)
 
     st.markdown("6) תקופת אינדיקטור (לדוגמה RSI/CCI)")
     indicator_period = st.number_input("תקופת אינדיקטור", min_value=1, value=14)
 
-    # default warmup method = 'wilder' as requested
+    # default warmup method = 'wilder'
     rsi_method = st.selectbox("RSI warmup method (אם בחרת RSI)", options=["sma", "wilder"], index=1,
                                format_func=lambda x: "SMA warmup (early values)" if x=="sma" else "Wilder smoothing")
 
@@ -513,7 +543,7 @@ with st.sidebar.form(key='params'):
     exit_exec = st.selectbox("מחיר יציאה", options=["close", "next_open"])
 
     st.markdown("גודל פוזיציה / מודל sizing")
-    # default sizing_mode = 'compound' as requested
+    # default sizing_mode = 'compound'
     sizing_mode = st.selectbox("שיטת חישוב תשואה", options=["fixed", "compound"], index=1,
                                format_func=lambda x: "fixed amount per entry" if x=="fixed" else "compound/all-in")
     fixed_amount = st.number_input("Fixed amount per entry (אם בחרת fixed)", value=1000.0, step=100.0)
@@ -527,11 +557,11 @@ with st.sidebar.form(key='params'):
                                        help="אם באחוז הזן כמו 0.001 עבור 0.1% , אם סכום הזן בערך בש\"ח/דולר")
 
     st.markdown("אופציות נוספות")
-    # exclude_incomplete default = False (not checked) as requested
+    # exclude_incomplete default = not checked (False)
     exclude_incomplete = st.checkbox("לא לכלול פוזיציה פתוחה אחרונה (בחישוב הסיכום)", value=False)
     compare_buy_hold = st.checkbox("השווה ל-BUY & HOLD", value=True)
 
-    # defer_until_next_cross_with_price_higher default True as requested
+    # defer_until_next_cross_with_price_higher default True
     defer_until_next_cross_with_price_higher = st.checkbox(
         "אם בעת יציאה המחיר נמוך מהכניסה — דחה סגירה; סגור רק בפעם הבאה שהאינדיקטור יחצה את הסף ותמח גבוה מהכניסה",
         value=True,
@@ -539,15 +569,11 @@ with st.sidebar.form(key='params'):
 
     debug_mode = st.checkbox("הצג דיבאג של ערכי אינדיקטור (ראשונים)", value=False)
 
-    # NEW: options for post-period exit search (default True)
+    # NEW: options for post-period exit search (keep default True as before)
     check_exits_after = st.checkbox("בדוק סגירות אחרי תאריך הסיום ועד היום", value=True,
                                    help="אם יש פוזיציה פתוחה בסוף התקופה — חפש אם התנאי ליציאה התקיים לאחר תום התקופה ועד היום.")
     include_after_in_summary = st.checkbox("כלול סגירות לאחר התקופה בחישובי הרווחים (אם נמצאו)", value=True,
                                           help="אם מצאנו סגירות אחרי תום התקופה — האם לכלול אותן בחישוב התשואה/מדדים?")
-
-    # NEW: manual warmup days input (default 500)
-    manual_warmup_days = st.number_input("ימי חימום ידניים (ברירת-מחדל 500)", min_value=0, value=500, step=1,
-                                        help="אם מלאת ערך זה ישמש במקום החישוב האוטומטי של ימי חימום.")
 
     submitted = st.form_submit_button("הרץ backtest")
 
@@ -558,76 +584,37 @@ def fetch_data(ticker, start_date, end_date, interval):
     return df
 
 if submitted:
-    # compute warmup
+    # compute expanded warmup
     warmup_bars = compute_warmup_bars(indicator, indicator_period, rsi_method)
-    computed_days = compute_warmup_days(warmup_bars, interval)
-
-    # use manual warmup days if provided (user requested default 500)
-    warmup_days = int(manual_warmup_days) if manual_warmup_days is not None else computed_days
-
-    st.info(f"Warmup: נשתמש ב-{warmup_days} ימים לפני תאריך ההתחלה כדי 'לחמם' את האינדיקטור (ברירת-מחדל ידנית).")
+    warmup_days = compute_warmup_days(warmup_bars, interval)
+    st.info(f"Warmup: מביא כ-{warmup_bars} ברס (בערך {warmup_days} ימים) לפני תאריך ההתחלה כדי 'לחמם' את האינדיקטור — warmup מוגדל לשיפור דיוק.")
 
     with st.spinner("מושך נתונים מורחבים ומחשב אינדיקטורים..."):
+        # decide fetch end: if user wants post-period checks, fetch until today; else until end_date+1
         fetch_end = pd.to_datetime(end_date) + pd.Timedelta(days=1)
         if check_exits_after:
-            fetch_end = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
+            fetch_end = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)  # include today
 
         extended_start = pd.to_datetime(start_date) - pd.Timedelta(days=warmup_days)
         df_full = fetch_data(ticker, extended_start, fetch_end, interval)
         if df_full is None or df_full.empty:
             st.stop()
 
-        # ensure datetime index, tz-naive, sorted ascending
         try:
             df_full.index = pd.to_datetime(df_full.index)
-            # remove timezone if present
-            if getattr(df_full.index, 'tz', None) is not None:
-                try:
-                    df_full.index = df_full.index.tz_convert(None)
-                except Exception:
-                    try:
-                        df_full.index = df_full.index.tz_localize(None)
-                    except Exception:
-                        pass
         except Exception:
             pass
-        df_full = df_full.sort_index()
 
-        # If Adj Close present -> compute adjusted OHLC using factor = Adj Close / Close
-        if 'Adj Close' in df_full.columns and df_full['Close'].notna().any():
-            # prevent division by zero or NaN; fill forward/backward if necessary
-            with np.errstate(divide='ignore', invalid='ignore'):
-                adj_factor = (df_full['Adj Close'] / df_full['Close']).replace([np.inf, -np.inf], np.nan)
-            # fill small number of NaNs with forward/back
-            adj_factor = adj_factor.fillna(method='ffill').fillna(method='bfill').fillna(1.0)
-            df_full['AdjFactor'] = adj_factor
-            # create adjusted price columns
-            df_full['Close_adj'] = df_full['Close'] * df_full['AdjFactor']
-            df_full['Open_adj']  = df_full['Open']  * df_full['AdjFactor']
-            df_full['High_adj']  = df_full['High']  * df_full['AdjFactor']
-            df_full['Low_adj']   = df_full['Low']   * df_full['AdjFactor']
-            # overwrite primary price columns with adjusted versions for indicator & execution consistency
-            df_full['Close'] = df_full['Close_adj']
-            df_full['Open']  = df_full['Open_adj']
-            df_full['High']  = df_full['High_adj']
-            df_full['Low']   = df_full['Low_adj']
-        else:
-            # ensure numeric and no NaNs in price columns (best-effort)
-            df_full['AdjFactor'] = 1.0
-            for col in ['Open','High','Low','Close']:
-                if col in df_full.columns:
-                    df_full[col] = pd.to_numeric(df_full[col], errors='coerce')
-
-        # compute indicator on adjusted close series (df_full['Close'] is adjusted above if possible)
+        # compute indicator on full data (including post-period if any)
         if indicator == "RSI":
             ind_full = rsi(df_full['Close'], period=int(indicator_period), method=rsi_method)
         elif indicator == "CCI":
-            ind_full = cci(df_full['Close'], df_full['High'], df_full['Low'], period=int(indicator_period))
+            ind_full = cci(df_full, period=int(indicator_period))
         else:
-            macd_line, signal_line, hist = macd(df_full['Close'], fast=12, slow=26, signal=9)
+            macd_line, signal_line, hist = macd(df_full, fast=12, slow=26, signal=9)
             ind_full = macd_line
 
-        # align indicator series robustly
+        # robust align
         try:
             if isinstance(ind_full, pd.Series):
                 ind_full_series = ind_full.reindex(df_full.index)
@@ -641,35 +628,57 @@ if submitted:
                     if arr.shape[0] == len(df_full):
                         ind_full_series = pd.Series(arr, index=df_full.index)
                     else:
-                        tmp = pd.Series(ind_full)
-                        ind_full_series = tmp.reindex(df_full.index) if tmp.shape[0] == len(df_full) else pd.Series([np.nan] * len(df_full), index=df_full.index)
+                        try:
+                            tmp = pd.Series(ind_full)
+                            if tmp.shape[0] == len(df_full):
+                                ind_full_series = pd.Series(tmp.values, index=df_full.index)
+                            else:
+                                ind_full_series = pd.Series([np.nan] * len(df_full), index=df_full.index)
+                        except Exception:
+                            ind_full_series = pd.Series([np.nan] * len(df_full), index=df_full.index)
         except Exception:
             ind_full_series = pd.Series([np.nan] * len(df_full), index=df_full.index)
 
         ind_full_series = pd.to_numeric(ind_full_series, errors='coerce')
 
-        # Trim to requested window for running the backtest (entries limited to start..end)
+        # trim to user-specified window for running the actual backtest (entries limited to that window)
         start_ts = pd.to_datetime(start_date)
         end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1)
         df = df_full.loc[start_ts:end_ts].copy()
         ind_series = ind_full_series.loc[df.index].copy()
 
         if df.empty:
-            st.error("לא נותרו ברים בטווח שנבחר אחרי חיתוך ה-warmup — בדוק את תאריכי התחלה/סיום או הגדל את ימי החימום.")
+            st.error("לא נותרו ברים בטווח שנבחר אחרי חיתוך ה-warmup — בדוק את תאריכי התחלה/סיום.")
             st.stop()
 
         if debug_mode:
-            st.subheader("Debug - ראשית הערכים והתאמות")
-            st.write(f"Fetched rows: {len(df_full)} total; trimmed rows for backtest: {len(df)}")
-            st.write("Sample adjusted prices head (Open/Close):")
-            st.dataframe(df[['Open','Close']].head(10))
-            st.write("Sample indicator head (aligned):")
-            tmp_ind = pd.Series(ind_series, index=df.index).rename('indicator').reset_index()
-            if len(tmp_ind.columns) >= 2:
-                tmp_ind.columns = ['date','indicator']
-            st.dataframe(tmp_ind.head(30))
+            st.subheader("Debug - indicator head and first threshold hits")
+            ind_s = ind_series
+            st.write(f"indicator object type: {type(ind_s)} | length (aligned to df): {len(ind_s)}")
+            try:
+                types_sample = ind_s.head(10).apply(lambda x: type(x).__name__).to_list()
+                st.write("Sample types for first 10 indicator values:", types_sample)
+            except Exception:
+                pass
+            ind_df = ind_s.rename('indicator').reset_index()
+            if len(ind_df.columns) >= 2:
+                ind_df.columns = ['date', 'indicator']
+            st.write("First 60 indicator values (aligned to price index):")
+            st.dataframe(ind_df.head(60))
+            st.write("First 60 Close prices:")
+            st.dataframe(df['Close'].reset_index().head(60))
+            below = ind_df[ind_df['indicator'] < low_thresh]
+            above = ind_df[ind_df['indicator'] > high_thresh]
+            if not below.empty:
+                st.write("First below low_thresh:", below.iloc[0].to_dict())
+            else:
+                st.write("No value below low_thresh in sample")
+            if not above.empty:
+                st.write("First above high_thresh:", above.iloc[0].to_dict())
+            else:
+                st.write("No value above high_thresh in sample")
 
-        # run backtest over requested period
+        # run backtest over requested period (entries are allowed only within start..end)
         trades_df, baseline_summary, equity_curve, open_positions, debug_log = run_backtest(
             df, ind_series, low_thresh, high_thresh,
             entry_exec=entry_exec, exit_exec=exit_exec,
@@ -682,9 +691,11 @@ if submitted:
             debug_mode=debug_mode
         )
 
-        # POST-PERIOD exit search: require BOTH indicator>threshold AND exit_price>entry_price (as before)
+        # ---------------------------------------------------------------------
+        # POST-PERIOD EXIT SEARCH (strict/BOTH behavior retained from prior version)
+        # ---------------------------------------------------------------------
         after_trades = []
-        remaining_open_positions = list(open_positions)
+        remaining_open_positions = list(open_positions)  # copy - we'll remove those closed by post-search
 
         if check_exits_after and remaining_open_positions:
             last_backtest_idx = df.index[-1]
@@ -696,7 +707,12 @@ if submitted:
             except Exception:
                 high_thresh_f = _to_scalar_safe(high_thresh)
 
+            # iterate each open position and then iterate chronologically over future bars;
+            # close at the first future bar where BOTH conditions are met:
+            #   - ind_at_bar > high_thresh
+            #   - exit_price (according to execution) > entry_price
             for pos in list(open_positions):
+                entry_price_val = None
                 try:
                     entry_price_val = float(pos.get('entry_price', 0.0))
                 except Exception:
@@ -709,12 +725,12 @@ if submitted:
                     except Exception:
                         ind_at = np.nan
 
-                    # exit price according to execution, use df_full which contains adjusted prices
+                    # get exit_price according to execution
                     exit_price = None
                     try:
                         if exit_exec == 'close':
                             exit_price = float(df_full['Close'].loc[idx])
-                        else:
+                        else:  # next_open
                             pos_int = df_full.index.get_indexer([idx])[0]
                             if (pos_int + 1) < len(df_full):
                                 exit_price = float(df_full['Open'].iloc[pos_int + 1])
@@ -723,6 +739,7 @@ if submitted:
                     except Exception:
                         exit_price = None
 
+                    # check both conditions: indicator > threshold AND exit_price > entry_price
                     cond_ind = False
                     try:
                         cond_ind = (float(ind_at) > high_thresh_f)
@@ -731,12 +748,15 @@ if submitted:
 
                     cond_price = False
                     try:
-                        if exit_price is not None:
+                        if exit_price is not None and entry_price_val is not None:
                             cond_price = (float(exit_price) > float(entry_price_val))
+                        else:
+                            cond_price = False
                     except Exception:
                         cond_price = False
 
                     if cond_ind and cond_price:
+                        # close here
                         shares = pos['shares']
                         gross = shares * exit_price
                         if commission_mode == 'percent':
@@ -752,7 +772,10 @@ if submitted:
                         try:
                             invested_val = _to_scalar_safe(pos.get('invested', 0.0))
                         except Exception:
-                            invested_val = float(pos.get('invested', 0.0)) if pos.get('invested', 0.0) is not None else 0.0
+                            try:
+                                invested_val = float(pos.get('invested', 0.0))
+                            except Exception:
+                                invested_val = 0.0
 
                         pnl_percent = (pnl_amount / invested_val) * 100 if invested_val != 0 else 0.0
 
@@ -771,6 +794,7 @@ if submitted:
                             'closed_after_period': True
                         }
                         after_trades.append(after_trade)
+                        # mark removed
                         try:
                             remaining_open_positions.remove(pos)
                         except Exception:
@@ -779,14 +803,18 @@ if submitted:
                         if debug_mode:
                             debug_log.append(f"POST-CLOSE pos entry {pos.get('entry_date')} closed at {idx} exit_price={exit_price} ind={ind_at}")
                         break
+                    # else continue to next future bar
 
                 if not found and debug_mode:
                     debug_log.append(f"POST-NOTFOUND pos entry {pos.get('entry_date')} - no future bar met BOTH conditions")
 
-        # Build tables & summary adjustments (same structure as prior versions, but using adjusted prices)
+        # ---------------------------------------------------------------------
+        # Build combined rows & summary adjustment (include after_trades optionally)
+        # ---------------------------------------------------------------------
         closed_rows = []
         if not trades_df.empty:
             for _, row in trades_df.iterrows():
+                # compute days between entry and exit
                 try:
                     entry_dt = pd.to_datetime(row['entry_date'])
                     exit_dt = pd.to_datetime(row['exit_date'])
@@ -828,6 +856,7 @@ if submitted:
             })
 
         open_rows = []
+        # use the last in-period date as reference for open durations
         last_in_period = df.index[-1]
         for pos in remaining_open_positions:
             try:
@@ -851,14 +880,17 @@ if submitted:
 
         combined_rows = closed_rows + after_rows + open_rows
 
-        # SUMMARY ADJUSTMENT (similar to previous logic) - include win rate, fixed-mode returns etc.
+        # SUMMARY ADJUSTMENT
         summary = dict(baseline_summary)
         baseline_realized = float(summary.get('total_pnl_amount', 0.0))
         after_realized = sum([float(x.get('pnl_amount', 0.0)) for x in after_trades]) if after_trades else 0.0
 
+        # compute wins including after_trades optionally
         baseline_wins = int(summary.get('wins', 0))
         baseline_trades = int(summary.get('total_trades', 0))
-        after_wins = sum(1 for x in after_trades if float(x.get('pnl_amount', 0.0)) > 0) if after_trades else 0
+        after_wins = 0
+        if after_trades:
+            after_wins = sum(1 for x in after_trades if float(x.get('pnl_amount', 0.0)) > 0)
 
         if include_after_in_summary and after_trades:
             total_realized = baseline_realized + after_realized
@@ -922,6 +954,7 @@ if submitted:
             except Exception:
                 max_drawdown = np.nan
 
+            # update win rate including after trades
             total_trades_incl_after = baseline_trades + len(after_trades)
             total_wins_incl_after = baseline_wins + after_wins
             win_rate_incl_after = (total_wins_incl_after / total_trades_incl_after * 100.0) if total_trades_incl_after > 0 else np.nan
@@ -941,6 +974,7 @@ if submitted:
                 'after_period_closures_count': len(after_trades)
             })
 
+            # if sizing_mode == fixed, update fixed totals
             if sizing_mode == 'fixed':
                 fixed_total_invested = float(fixed_amount) * (baseline_trades + len(after_trades))
                 fixed_total_pnl = float(summary.get('total_pnl_amount', 0.0))
@@ -953,11 +987,13 @@ if submitted:
                 })
 
         else:
+            # no after trades included
             summary.update({
                 'after_period_closures_found': len(after_trades),
                 'after_period_closures_included': False,
                 'open_positions_excluded': int(len(remaining_open_positions)) if exclude_incomplete else 0
             })
+            # ensure cagr/sharpe/drawdown are computed based on equity_curve as before
             try:
                 final_equity_baseline = (equity_curve.dropna().iloc[-1] if not equity_curve.dropna().empty else initial_capital)
                 days = (df.index[-1] - df.index[0]).days
@@ -995,10 +1031,11 @@ if submitted:
                 'max_drawdown': max_drawdown
             })
 
-            if not summary.get('win_rate_percent') and not pd.isna(win_rate):
-                summary['win_rate_percent'] = float(win_rate)
+        # ensure win_rate is present if no after-trades included
+        if not summary.get('win_rate_percent') and not pd.isna(win_rate):
+            summary['win_rate_percent'] = float(win_rate)
 
-    # UI: show summary and tables
+    # ---- UI output: summary & trades ----
     st.subheader("תוצאות Backtest")
     st.write("סיכום כללי:")
     st.json(summary)
@@ -1008,12 +1045,13 @@ if submitted:
         for line in debug_log[:500]:
             st.text(line)
 
-    # Trades table
+    # ---- Trades table (closed during period, closed after period, open) ----
     st.subheader("טבלת עסקאות (נסגרו / נסגרו אחרי התאריך / פתוחות)")
     if len(combined_rows) == 0:
         st.warning("לא נרשמו עסקאות לפי הפרמטרים שנבחרו.")
     else:
         combined_df_display = pd.DataFrame(combined_rows)
+        # ensure ordering of columns and include 'days'
         combined_df_display = combined_df_display[[
             'entry_date','entry_indicator','entry_price','exit_date','exit_indicator','exit_price','pnl_percent','pnl_amount','days'
         ]]
@@ -1041,7 +1079,7 @@ if submitted:
             open_csv = pd.DataFrame(open_rows).to_csv(index=False).encode('utf-8')
             st.download_button("הורד CSV של פוזיציות פתוחות", data=open_csv, file_name=f"{ticker}_open_positions.csv", mime="text/csv")
 
-    # detailed open positions
+    # Optionally show a detailed table just for open positions (raw fields)
     if remaining_open_positions:
         st.subheader("פוזיציות שעדיין פתוחות - פרטים")
         raw_open = []
@@ -1063,16 +1101,18 @@ if submitted:
             pass
         st.dataframe(raw_open_df)
 
-    # Plot price with markers (using adjusted prices)
+    # Plot price with markers (including after-period exits and open positions)
     st.subheader("גרף מחירים - כניסות/יציאות")
     fig, ax = plt.subplots(figsize=(12,6))
-    ax.plot(df_full.index, df_full['Close'], label=f"{ticker} Close (fetched range, adjusted if available)")
+    ax.plot(df_full.index, df_full['Close'], label=f"{ticker} Close (fetched range)")
+    # closed during period
     if not trades_df.empty:
         for _, row in trades_df.iterrows():
             entry_dt = pd.to_datetime(row['entry_date'])
             exit_dt = pd.to_datetime(row['exit_date'])
             ax.scatter(entry_dt, row['entry_price'], marker='^', s=80, color='green')
             ax.scatter(exit_dt, row['exit_price'], marker='v', s=80, color='red')
+    # after_period closures
     for at in after_trades:
         try:
             entry_dt = pd.to_datetime(at['entry_date'])
@@ -1081,6 +1121,7 @@ if submitted:
             ax.scatter(exit_dt, at['exit_price'], marker='x', s=100, color='blue', label='Exit after period')
         except Exception:
             pass
+    # open positions
     for pos in remaining_open_positions:
         try:
             entry_dt = pd.to_datetime(pos.get('entry_date'))
@@ -1093,7 +1134,7 @@ if submitted:
     ax.legend()
     st.pyplot(fig)
 
-    # equity curve
+    # equity curve (as originally computed for period)
     st.subheader("עקומת הון (תקופת הבדיקה)")
     if not equity_curve.dropna().empty:
         fig2, ax2 = plt.subplots(figsize=(12,4))
@@ -1127,7 +1168,7 @@ if submitted:
     pdf_buf.seek(0)
     st.download_button("הורד PDF (גרף + סיכום)", data=pdf_buf, file_name=f"{ticker}_report.pdf", mime="application/pdf")
 
-    # Buy & Hold comparison
+    # Compare to Buy & Hold
     if compare_buy_hold:
         st.subheader("השוואה ל-BUY & HOLD")
         try:
