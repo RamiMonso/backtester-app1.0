@@ -26,7 +26,7 @@ import math
 st.set_page_config(page_title="Indicator Backtester — Improved (real-indicator option)", layout="wide")
 
 # ------------------------
-# Utility: robust numeric coercion and column normalization
+# Safe numeric coercion helper (prevents TypeError on weird column types)
 # ------------------------
 def ensure_numeric_series(x, index=None):
     """
@@ -37,6 +37,7 @@ def ensure_numeric_series(x, index=None):
         if x.shape[1] == 1:
             x = x.iloc[:, 0]
         else:
+            # try to find first numeric-like column
             for c in x.columns:
                 try:
                     s = pd.to_numeric(x[c], errors='coerce')
@@ -98,68 +99,11 @@ def ensure_numeric_series(x, index=None):
         length = len(index) if index is not None else 1
         return pd.Series([np.nan] * length, index=index if index is not None else None, dtype=float)
 
-
-def normalize_df_columns(df):
-    """
-    Robustly detect important columns (Open/High/Low/Close/Adj Close/Volume), rename them consistently and coerce numeric.
-    """
-    if not isinstance(df, pd.DataFrame):
-        raise ValueError("normalize_df_columns expects a DataFrame")
-    df = df.copy()
-    col_map = {}
-    for c in df.columns:
-        try:
-            key = str(c).lower().replace(" ", "").replace("_", "").replace("-", "")
-        except Exception:
-            key = repr(c).lower()
-        col_map[key] = c
-
-    def find_col(possible_names):
-        for name in possible_names:
-            name_norm = name.lower().replace(" ", "").replace("_", "").replace("-", "")
-            for k, orig in col_map.items():
-                if name_norm in k:
-                    return orig
-        return None
-
-    found_open = find_col(["open", "o"])
-    found_high = find_col(["high", "h"])
-    found_low = find_col(["low", "l"])
-    found_close = find_col(["adjclose", "adj_close", "adj", "close", "c"])
-    found_adj_close = None
-    for k, orig in col_map.items():
-        if 'adj' in k and 'close' in k:
-            found_adj_close = orig
-            break
-    found_volume = find_col(["volume", "vol"])
-
-    rename_map = {}
-    if found_open is not None:
-        rename_map[found_open] = "Open"
-    if found_high is not None:
-        rename_map[found_high] = "High"
-    if found_low is not None:
-        rename_map[found_low] = "Low"
-    if found_close is not None:
-        rename_map[found_close] = "Close"
-    if found_adj_close is not None:
-        rename_map[found_adj_close] = "Adj Close"
-    if found_volume is not None:
-        rename_map[found_volume] = "Volume"
-
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if c in df.columns:
-            df[c] = ensure_numeric_series(df[c], index=df.index)
-    return df
-
 # ------------------------
-# Indicators
+# Indicator implementations
 # ------------------------
 def ema(series, period):
-    s = ensure_numeric_series(series, index=series.index if isinstance(series, pd.Series) else None)
+    s = ensure_numeric_series(series)
     return s.ewm(span=period, adjust=False).mean()
 
 def macd(df, fast=12, slow=26, signal=9):
@@ -169,7 +113,7 @@ def macd(df, fast=12, slow=26, signal=9):
     return macd_line, signal_line, hist
 
 def rsi(series, period=14, method='sma'):
-    s = ensure_numeric_series(series, index=series.index if isinstance(series, pd.Series) else None)
+    s = ensure_numeric_series(series)
     delta = s.diff()
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
@@ -185,9 +129,9 @@ def rsi(series, period=14, method='sma'):
     return rsi_v
 
 def cci(df, period=20):
-    close = ensure_numeric_series(df['Close'], index=df.index)
-    high = ensure_numeric_series(df['High'], index=df.index)
-    low = ensure_numeric_series(df['Low'], index=df.index)
+    close = ensure_numeric_series(df['Close'])
+    high = ensure_numeric_series(df['High'])
+    low = ensure_numeric_series(df['Low'])
     tp = (high + low + close) / 3
     sma_tp = tp.rolling(window=period).mean()
     mad = tp.rolling(window=period).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
@@ -195,7 +139,7 @@ def cci(df, period=20):
     return cci_v
 
 # ------------------------
-# Warmup helpers
+# Warmup helpers (same as before)
 # ------------------------
 def compute_warmup_bars(indicator_name, indicator_period, rsi_method):
     p = int(max(1, int(indicator_period)))
@@ -448,6 +392,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
 
         # ----- EXIT LOGIC ----- #
         for pos in positions[:]:
+            # default: determine exit_price according to execution
             if exit_exec == 'close':
                 exit_price_raw = df['Close'].iloc[i]
             else:
@@ -500,6 +445,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
                     if debug_mode:
                         debug_log.append(f"BAR {i} {date} - exit_price <= entry_price ({exit_price} <= {entry_price_val}) - keep deferred")
                     continue
+                # else proceed to close
 
             else:
                 try:
@@ -510,6 +456,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
                 if exit_price is None:
                     continue
 
+            # compute PnL
             shares = pos['shares']
             gross = shares * exit_price
             if commission_mode == 'percent':
@@ -547,11 +494,13 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
             }
             trades.append(trade)
 
+            # update realized pnl and remove position
             cumulative_realized_pnl += pnl_amount
             positions.remove(pos)
             if debug_mode:
                 debug_log.append(f"BAR {i} {date} - CLOSED trade entry_i={pos['entry_i']} exit_i={i} pnl={pnl_amount}")
 
+        # compute equity at this bar (realized + unrealized)
         unrealized = 0.0
         for pos in positions:
             try:
@@ -564,9 +513,11 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
         if debug_mode and not entered_this_bar:
             debug_log.append(f"BAR {i} {date} - indicator={ind_val_float:.4f} low={low_thresh_f} entered={entered_this_bar} positions={len(positions)}")
 
+    # Finished loop
     trades_df = pd.DataFrame(trades)
 
-    open_positions_list = positions
+    # ---- Build baseline summary (apply exclude_incomplete as baseline) ----
+    open_positions_list = positions  # remaining open positions
     open_positions_count = len(open_positions_list)
 
     if equity_curve.dropna().empty:
@@ -583,6 +534,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
     total_return_amount_baseline = final_equity_baseline - initial_capital
     total_return_pct_baseline = (total_return_amount_baseline / initial_capital) * 100 if initial_capital != 0 else 0.0
 
+    # compute baseline win rate
     total_trades = len(trades_df)
     wins = 0
     if total_trades > 0:
@@ -601,6 +553,7 @@ def run_backtest(df, indicator_series, low_thresh, high_thresh,
         'open_positions_excluded': int(open_positions_count) if exclude_incomplete else 0
     }
 
+    # If fixed sizing, compute fixed-mode returns as user requested:
     if sizing_mode == 'fixed':
         if total_trades > 0:
             fixed_total_invested = float(fixed_amount) * total_trades
@@ -648,6 +601,7 @@ with st.sidebar.form(key='params'):
     st.markdown("6) תקופת אינדיקטור (לדוגמה RSI/CCI)")
     indicator_period = st.number_input("תקופת אינדיקטור", min_value=1, value=14)
 
+    # RSI warmup selection (default 'wilder')
     rsi_method = st.selectbox("RSI warmup method (אם בחרת RSI)", options=["sma", "wilder"], index=1,
                                format_func=lambda x: "SMA warmup (early values)" if x=="sma" else "Wilder smoothing")
 
@@ -679,31 +633,25 @@ with st.sidebar.form(key='params'):
 
     debug_mode = st.checkbox("הצג דיבאג של ערכי אינדיקטור (ראשונים)", value=False)
 
+    # NEW: use real indicator / upload CSV
     use_real_indicators = st.checkbox("השתמש בערכי אינדיקטור אמיתיים מה-Yahoo / העלה CSV (Use real indicator values)", value=False,
                                       help="אם מסומן — המערכת תנסה להשתמש בעמודת אינדיקטור מתוך נתוני yfinance או בקובץ CSV שתעלה. יחד עם זאת גם שערי המניה יהיו מהנתונים שנמשכו.")
     uploaded_indicator_file = None
     if use_real_indicators:
         uploaded_indicator_file = st.file_uploader("העלה קובץ CSV עם עמודת תאריך ועמודת אינדיקטור (אופציונלי)", type=['csv'], help="עמודה אחת צריכה להיות תאריך, השנייה ערך אינדיקטור. אם לא תעלה — המערכת תחפש בעמודות שנמשכו משירות.")
 
+    # post-period options
     check_exits_after = st.checkbox("בדוק סגירות אחרי תאריך הסיום ועד היום", value=True,
                                    help="אם יש פוזיציה פתוחה בסוף התקופה — חפש אם התנאי ליציאה התקיים לאחר תום התקופה ועד היום.")
     include_after_in_summary = st.checkbox("כלול סגירות לאחר התקופה בחישובי הרווחים (אם נמצאו)", value=True)
 
     submitted = st.form_submit_button("הרץ backtest")
 
-# helper: fetch data
 def fetch_data(ticker, start_date, end_date, interval):
-    try:
-        df = yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
-        if df is None:
-            return pd.DataFrame()
-        try:
-            df.index = pd.to_datetime(df.index)
-        except Exception:
-            pass
-        return df
-    except Exception:
+    df = yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
+    if df is None or df.empty:
         return pd.DataFrame()
+    return df
 
 # ------------------------
 # Main execution
@@ -714,6 +662,7 @@ if submitted:
     st.info(f"Warmup: מביא כ-{warmup_bars} ברס (בערך {warmup_days} ימים) לפני תאריך ההתחלה כדי 'לחמם' את האינדיקטור — warmup מוגדל לשיפור דיוק.")
 
     with st.spinner("מושך נתונים מורחבים ומחשב/משתמש באינדיקטורים..."):
+        # decide fetch end: if user wants post-period checks, fetch until today; else until end_date+1
         fetch_end = pd.to_datetime(end_date) + pd.Timedelta(days=1)
         if check_exits_after:
             fetch_end = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
@@ -721,37 +670,667 @@ if submitted:
         extended_start = pd.to_datetime(start_date) - pd.Timedelta(days=warmup_days)
         df_full = fetch_data(ticker, extended_start, fetch_end, interval)
 
+        # validate df_full
         if not isinstance(df_full, pd.DataFrame) or df_full.empty:
-            st.error("לא הצלחנו לקבל טווח נתונים תקין מ-Yahoo. נסה לשנות טווח/תדירות או כבה את 'נתוני אמת'.")
+            st.error("לא הצלחנו לקבל נתונים תקינים מ-Yahoo לנתונים מלאים. ודא חיבור אינטרנט וסימון נכון של טיקר/טווח.")
             st.stop()
 
+        # normalize index & ensure column names are strings
         try:
             df_full.index = pd.to_datetime(df_full.index)
         except Exception:
             pass
+        df_full.columns = [str(c) for c in df_full.columns]
 
-        # normalize and coerce numeric
-        try:
-            df_full = normalize_df_columns(df_full)
-        except Exception:
-            for c in df_full.columns:
-                try:
+        # If user requested "use real indicators", do NOT apply AdjFactor to prices (we want raw chart values).
+        # Otherwise, you may choose to apply Adj Close adjustments if you previously did so.
+        if not use_real_indicators:
+            if 'Adj Close' in df_full.columns and df_full['Close'].notna().any():
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    adjf = (df_full['Adj Close'] / df_full['Close']).replace([np.inf, -np.inf], np.nan)
+                adjf = adjf.fillna(method='ffill').fillna(method='bfill').fillna(1.0)
+                df_full['AdjFactor'] = adjf
+                for c in ['Close','Open','High','Low']:
+                    if c in df_full.columns:
+                        try:
+                            df_full[c] = ensure_numeric_series(df_full[c] * df_full['AdjFactor'], index=df_full.index)
+                        except Exception:
+                            df_full[c] = ensure_numeric_series(df_full[c], index=df_full.index)
+            else:
+                df_full['AdjFactor'] = 1.0
+                for c in ['Open','High','Low','Close']:
+                    if c in df_full.columns:
+                        df_full[c] = ensure_numeric_series(df_full[c], index=df_full.index)
+        else:
+            for c in ['Open','High','Low','Close']:
+                if c in df_full.columns:
                     df_full[c] = ensure_numeric_series(df_full[c], index=df_full.index)
+
+        # compute indicator locally (fallback)
+        if indicator == "RSI":
+            ind_computed = rsi(df_full['Close'], period=int(indicator_period), method=rsi_method)
+        elif indicator == "CCI":
+            ind_computed = cci(df_full, period=int(indicator_period))
+        else:
+            macd_line, signal_line, hist = macd(df_full, fast=12, slow=26, signal=9)
+            ind_computed = macd_line
+
+        ind_full_series = None
+        used_real_source = None
+
+        # If user uploaded CSV, try to use it
+        if use_real_indicators and uploaded_indicator_file is not None:
+            try:
+                file_content = uploaded_indicator_file.read().decode('utf-8')
+                csv_df = pd.read_csv(StringIO(file_content))
+                # detect date column & indicator column
+                col_date = None
+                col_ind = None
+                for c in csv_df.columns:
+                    if 'date' in str(c).lower() or 'time' in str(c).lower() or 'datetime' in str(c).lower():
+                        col_date = c
+                        break
+                for c in csv_df.columns:
+                    if c == col_date:
+                        continue
+                    if indicator.lower() in str(c).lower() or 'indicator' in str(c).lower() or 'value' in str(c).lower():
+                        col_ind = c
+                        break
+                if col_ind is None:
+                    for c in csv_df.columns:
+                        if c != col_date:
+                            try:
+                                tmp = pd.to_numeric(csv_df[c], errors='coerce')
+                                if tmp.notna().any():
+                                    col_ind = c
+                                    break
+                            except Exception:
+                                continue
+                if col_date is None:
+                    st.warning("לא זוהתה עמודת תאריך בקובץ ה-CSV. יש לוודא שיש עמודת תאריך/זמן.")
+                else:
+                    csv_df[col_date] = pd.to_datetime(csv_df[col_date])
+                    csv_df = csv_df.set_index(col_date).sort_index()
+                    if col_ind is None:
+                        st.warning("לא זוהתה עמודת אינדיקטור בקובץ ה-CSV; נעשה ניסיון להשתמש בעמודה הראשונה הלא-תאריך.")
+                        others = [c for c in csv_df.columns]
+                        col_ind = others[0] if others else None
+                    if col_ind is not None:
+                        ind_full_series = ensure_numeric_series(csv_df[col_ind], index=csv_df.index)
+                        # align (try exact reindex, else nearest)
+                        aligned = ind_full_series.reindex(df_full.index)
+                        nan_ratio = aligned.isna().mean()
+                        if nan_ratio > 0.5:
+                            try:
+                                if interval == "1d":
+                                    ind_full_series = ind_full_series.reindex(df_full.index, method='nearest', tolerance=pd.Timedelta(days=1))
+                                else:
+                                    ind_full_series = ind_full_series.reindex(df_full.index, method='nearest', tolerance=pd.Timedelta(hours=2))
+                            except Exception:
+                                ind_full_series = aligned
+                        else:
+                            ind_full_series = aligned
+                        used_real_source = "uploaded_csv"
+            except Exception as e:
+                st.warning(f"שגיאה בקריאת ה-CSV: {e}. נמשיך לנסות מקורות אחרים.")
+
+        # If not from CSV and user asked for real indicators, try to find a column inside df_full
+        if ind_full_series is None and use_real_indicators:
+            lower_cols = [str(c).lower() for c in df_full.columns]
+            found_col = None
+            for c in df_full.columns:
+                lc = str(c).lower()
+                if indicator.lower() == "rsi" and 'rsi' in lc:
+                    found_col = c; break
+                if indicator.lower() == "cci" and 'cci' in lc:
+                    found_col = c; break
+                if indicator.lower() == "macd" and 'macd' in lc and ('hist' not in lc):
+                    found_col = c; break
+            if found_col:
+                try:
+                    ind_full_series = ensure_numeric_series(df_full[found_col], index=df_full.index)
+                    used_real_source = f"df_full_col:{found_col}"
+                except Exception:
+                    ind_full_series = None
+
+        # fallback to computed
+        if ind_full_series is None:
+            ind_full_series = ensure_numeric_series(ind_computed, index=df_full.index)
+            used_real_source = "computed"
+
+        # coerce numeric & align
+        try:
+            ind_full_series = pd.to_numeric(ind_full_series, errors='coerce')
+        except Exception:
+            ind_full_series = ensure_numeric_series(ind_full_series, index=df_full.index)
+
+        # Trim to requested window for running the actual backtest (entries limited to that window)
+        start_ts = pd.to_datetime(start_date)
+        end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1)
+        df = df_full.loc[start_ts:end_ts].copy()
+        ind_series = ind_full_series.reindex(df.index).copy()
+
+        if df.empty:
+            st.error("לא נותרו ברים בטווח שנבחר אחרי חיתוך ה-warmup — בדוק את תאריכי התחלה/סיום.")
+            st.stop()
+
+        # prepare next_open convenience column
+        if 'Open' in df.columns:
+            df['next_open'] = df['Open'].shift(-1)
+        else:
+            df['next_open'] = np.nan
+
+        if debug_mode:
+            st.subheader("Debug - indicator head and first threshold hits")
+            st.write(f"indicator source used: {used_real_source}")
+            st.write(f"indicator object type: {type(ind_series)} | length (aligned to df): {len(ind_series)}")
+            try:
+                types_sample = ind_series.head(10).apply(lambda x: type(x).__name__).to_list()
+                st.write("Sample types for first 10 indicator values:", types_sample)
+            except Exception:
+                pass
+            ind_df = ind_series.rename('indicator').reset_index()
+            if len(ind_df.columns) >= 2:
+                ind_df.columns = ['date', 'indicator']
+            st.write("First 60 indicator values (aligned to price index):")
+            st.dataframe(ind_df.head(60))
+            st.write("First 60 Close prices:")
+            st.dataframe(df['Close'].reset_index().head(60))
+            below = ind_df[ind_df['indicator'] < low_thresh]
+            above = ind_df[ind_df['indicator'] > high_thresh]
+            if not below.empty:
+                st.write("First below low_thresh:", below.iloc[0].to_dict())
+            else:
+                st.write("No value below low_thresh in sample")
+            if not above.empty:
+                st.write("First above high_thresh:", above.iloc[0].to_dict())
+            else:
+                st.write("No value above high_thresh in sample")
+
+        # run backtest over requested period (entries are allowed only within start..end)
+        trades_df, baseline_summary, equity_curve, open_positions, debug_log = run_backtest(
+            df, ind_series, low_thresh, high_thresh,
+            entry_exec=entry_exec, exit_exec=exit_exec,
+            sizing_mode=sizing_mode, fixed_amount=fixed_amount,
+            initial_capital=initial_capital,
+            allow_multiple_entries=allow_multiple_entries,
+            commission_mode=commission_mode, commission_value=commission_value,
+            exclude_incomplete=exclude_incomplete,
+            defer_until_next_cross_with_price_higher=defer_until_next_cross_with_price_higher,
+            debug_mode=debug_mode
+        )
+
+        # ---------------------------------------------------------------------
+        # POST-PERIOD EXIT SEARCH (strict/BOTH behavior retained)
+        # ---------------------------------------------------------------------
+        after_trades = []
+        remaining_open_positions = list(open_positions)  # copy - we'll remove those closed by post-search
+
+        if check_exits_after and remaining_open_positions:
+            last_backtest_idx = df.index[-1]
+            future_inds = ind_full_series.loc[ind_full_series.index > last_backtest_idx]
+
+            try:
+                high_thresh_f = float(high_thresh)
+            except Exception:
+                high_thresh_f = _to_scalar_safe(high_thresh)
+
+            for pos in list(open_positions):
+                entry_price_val = None
+                try:
+                    entry_price_val = float(pos.get('entry_price', 0.0))
+                except Exception:
+                    entry_price_val = 0.0
+
+                found = False
+                for idx in future_inds.index:
+                    try:
+                        ind_at = float(future_inds.loc[idx]) if not pd.isna(future_inds.loc[idx]) else np.nan
+                    except Exception:
+                        ind_at = np.nan
+
+                    # get exit price according to execution
+                    exit_price = None
+                    try:
+                        if exit_exec == 'close':
+                            exit_price = float(df_full['Close'].loc[idx])
+                        else:
+                            pos_int = df_full.index.get_indexer([idx])[0]
+                            if (pos_int + 1) < len(df_full):
+                                exit_price = float(df_full['Open'].iloc[pos_int + 1])
+                            else:
+                                exit_price = None
+                    except Exception:
+                        exit_price = None
+
+                    cond_ind = (not pd.isna(ind_at)) and (ind_at > high_thresh_f)
+                    cond_price = (exit_price is not None) and (exit_price > entry_price_val)
+
+                    if cond_ind and cond_price:
+                        shares = pos['shares']
+                        gross = shares * exit_price
+                        if commission_mode == 'percent':
+                            commission_exit = gross * commission_value
+                        elif commission_mode == 'absolute':
+                            commission_exit = commission_value
+                        else:
+                            commission_exit = 0.0
+
+                        total_commissions = pos.get('commission_entry', 0.0) + commission_exit
+                        pnl_amount = (shares * exit_price) - (pos['invested']) - total_commissions
+
+                        try:
+                            invested_val = _to_scalar_safe(pos.get('invested', 0.0))
+                        except Exception:
+                            invested_val = float(pos.get('invested', 0.0)) if pos.get('invested', 0.0) is not None else 0.0
+
+                        pnl_percent = (pnl_amount / invested_val) * 100 if invested_val != 0 else 0.0
+
+                        after_trade = {
+                            'entry_date': pos['entry_date'],
+                            'entry_indicator': pos.get('entry_indicator', np.nan),
+                            'entry_price': pos.get('entry_price', np.nan),
+                            'exit_date': idx,
+                            'exit_indicator': ind_at,
+                            'exit_price': exit_price,
+                            'shares': shares,
+                            'invested': pos.get('invested', np.nan),
+                            'commission_total': total_commissions,
+                            'pnl_amount': pnl_amount,
+                            'pnl_percent': pnl_percent,
+                            'closed_after_period': True
+                        }
+                        after_trades.append(after_trade)
+                        try:
+                            remaining_open_positions.remove(pos)
+                        except Exception:
+                            pass
+                        found = True
+                        if debug_mode:
+                            debug_log.append(f"POST-CLOSE pos entry {pos.get('entry_date')} closed at {idx} exit_price={exit_price} ind={ind_at}")
+                        break
+
+                if not found and debug_mode:
+                    debug_log.append(f"POST-NOTFOUND pos entry {pos.get('entry_date')} - no future bar met BOTH conditions")
+
+        # ---------------------------------------------------------------------
+        # Build combined rows & summary adjustment
+        # ---------------------------------------------------------------------
+        closed_rows = []
+        if not trades_df.empty:
+            for _, row in trades_df.iterrows():
+                try:
+                    entry_dt = pd.to_datetime(row['entry_date'])
+                    exit_dt = pd.to_datetime(row['exit_date'])
+                    days = (exit_dt - entry_dt).days
+                    exit_str = pd.to_datetime(row['exit_date']).strftime('%Y-%m-%d %H:%M') if pd.notna(row.get('exit_date')) else ''
+                except Exception:
+                    days = None
+                    exit_str = str(row.get('exit_date',''))
+                closed_rows.append({
+                    'entry_date': pd.to_datetime(row['entry_date']).strftime('%Y-%m-%d %H:%M'),
+                    'entry_indicator': row.get('entry_indicator', np.nan),
+                    'entry_price': row.get('entry_price', np.nan),
+                    'exit_date': exit_str,
+                    'exit_indicator': row.get('exit_indicator', np.nan),
+                    'exit_price': row.get('exit_price', np.nan),
+                    'pnl_percent': row.get('pnl_percent', np.nan),
+                    'pnl_amount': row.get('pnl_amount', np.nan),
+                    'days': days
+                })
+
+        after_rows = []
+        for at in after_trades:
+            try:
+                exit_dt = pd.to_datetime(at['exit_date'])
+                entry_dt = pd.to_datetime(at['entry_date'])
+                exit_dt_s = exit_dt.strftime('%Y-%m-%d %H:%M')
+                days = (exit_dt - entry_dt).days
+            except Exception:
+                exit_dt_s = str(at['exit_date']); days = None
+            after_rows.append({
+                'entry_date': pd.to_datetime(at['entry_date']).strftime('%Y-%m-%d %H:%M') if not pd.isna(at['entry_date']) else at['entry_date'],
+                'entry_indicator': at.get('entry_indicator', np.nan),
+                'entry_price': at.get('entry_price', np.nan),
+                'exit_date': exit_dt_s,
+                'exit_indicator': at.get('exit_indicator', np.nan),
+                'exit_price': at.get('exit_price', np.nan),
+                'pnl_percent': at.get('pnl_percent', np.nan),
+                'pnl_amount': at.get('pnl_amount', np.nan),
+                'days': days
+            })
+
+        open_rows = []
+        last_in_period = df.index[-1]
+        for pos in remaining_open_positions:
+            try:
+                entry_dt = pd.to_datetime(pos.get('entry_date'))
+                entry_dt_s = entry_dt.strftime('%Y-%m-%d %H:%M')
+                days_open = (last_in_period - entry_dt).days
+            except Exception:
+                entry_dt_s = str(pos.get('entry_date')); days_open = None
+            open_rows.append({
+                'entry_date': entry_dt_s,
+                'entry_indicator': pos.get('entry_indicator', np.nan),
+                'entry_price': pos.get('entry_price', np.nan),
+                'exit_date': "עדיין לא התקיימו התנאים ליציאה",
+                'exit_indicator': np.nan,
+                'exit_price': np.nan,
+                'pnl_percent': np.nan,
+                'pnl_amount': np.nan,
+                'days': days_open
+            })
+
+        combined_rows = closed_rows + after_rows + open_rows
+
+        # SUMMARY ADJUSTMENT
+        summary = dict(baseline_summary)
+        baseline_realized = float(summary.get('total_pnl_amount', 0.0))
+        after_realized = sum([float(x.get('pnl_amount', 0.0)) for x in after_trades]) if after_trades else 0.0
+
+        baseline_wins = int(summary.get('wins', 0))
+        baseline_trades = int(summary.get('total_trades', 0))
+        after_wins = 0
+        if after_trades:
+            after_wins = sum(1 for x in after_trades if float(x.get('pnl_amount', 0.0)) > 0)
+
+        if include_after_in_summary and after_trades:
+            total_realized = baseline_realized + after_realized
+
+            unrealized_remaining = 0.0
+            for pos in remaining_open_positions:
+                try:
+                    last_price = float(df_full['Close'].iloc[-1])
+                    unrealized_remaining += (last_price - pos.get('entry_price', 0.0)) * pos.get('shares', 0.0)
                 except Exception:
                     pass
 
-        # compute computed indicators on full df
-        if indicator == "RSI":
-            ind_computed = rsi(df_full['Close'], period=int(indicator_period), method=rsi_method) if 'Close' in df_full.columns else pd.Series([np.nan]*len(df_full), index=df_full.index)
-        elif indicator == "CCI":
-            ind_computed = cci(df_full, period=int(indicator_period)) if all(x in df_full.columns for x in ['Close','High','Low']) else pd.Series([np.nan]*len(df_full), index=df_full.index)
-        else:
-            if 'Close' in df_full.columns:
-                macd_line, signal_line, hist = macd(df_full, fast=12, slow=26, signal=9)
-                ind_computed = macd_line
+            if exclude_incomplete:
+                final_equity_adj = initial_capital + total_realized
             else:
-                ind_computed = pd.Series([np.nan]*len(df_full), index=df_full.index)
+                final_equity_adj = initial_capital + total_realized + unrealized_remaining
 
-        # prepare indicator series (uploaded CSV or df column
+            total_return_amount_adj = final_equity_adj - initial_capital
+            total_return_pct_adj = (total_return_amount_adj / initial_capital) * 100 if initial_capital != 0 else 0.0
 
+            eq_for_metrics = equity_curve.copy()
+            try:
+                last_idx = eq_for_metrics.dropna().index[-1]
+                eq_for_metrics.loc[last_idx] = final_equity_adj
+            except Exception:
+                eq_for_metrics = pd.Series([final_equity_adj], index=[df.index[-1]])
 
+            try:
+                days = (df.index[-1] - df.index[0]).days
+                years = days / 365.25 if days > 0 else 0
+                if years > 0:
+                    cagr = ((final_equity_adj / initial_capital) ** (1 / years) - 1) * 100
+                else:
+                    cagr = np.nan
+            except Exception:
+                cagr = np.nan
+
+            try:
+                eq = eq_for_metrics.dropna()
+                returns = eq.pct_change().dropna()
+                if returns.shape[0] > 1 and returns.std() > 0:
+                    deltas = np.diff(df.index.astype('int64')) / 1e9
+                    median_delta = np.median(deltas) if len(deltas) > 0 else 24*3600
+                    if median_delta >= 23 * 3600:
+                        ppy = 252
+                    elif median_delta >= 3600:
+                        ppy = int(252 * 6.5)
+                    else:
+                        ppy = 252
+                    sharpe = (returns.mean() / returns.std()) * np.sqrt(ppy)
+                else:
+                    sharpe = np.nan
+            except Exception:
+                sharpe = np.nan
+
+            try:
+                eq = eq_for_metrics.dropna()
+                running_max = eq.cummax()
+                drawdown = (eq / running_max - 1)
+                max_drawdown = drawdown.min()
+            except Exception:
+                max_drawdown = np.nan
+
+            total_trades_incl_after = baseline_trades + len(after_trades)
+            total_wins_incl_after = baseline_wins + after_wins
+            win_rate_incl_after = (total_wins_incl_after / total_trades_incl_after * 100.0) if total_trades_incl_after > 0 else np.nan
+
+            summary.update({
+                'total_trades': int(summary.get('total_trades', 0)) + len(after_trades),
+                'wins': int(total_wins_incl_after),
+                'win_rate_percent': float(win_rate_incl_after) if not pd.isna(win_rate_incl_after) else None,
+                'total_pnl_amount': float(baseline_realized) + after_realized,
+                'total_return_amount': total_return_amount_adj,
+                'total_return_percent': total_return_pct_adj,
+                'cagr_percent': cagr,
+                'sharpe': sharpe,
+                'max_drawdown': max_drawdown,
+                'open_positions_excluded': int(len(remaining_open_positions)) if exclude_incomplete else 0,
+                'after_period_closures_included': True,
+                'after_period_closures_count': len(after_trades)
+            })
+
+            if sizing_mode == 'fixed':
+                fixed_total_invested = float(fixed_amount) * (baseline_trades + len(after_trades))
+                fixed_total_pnl = float(summary.get('total_pnl_amount', 0.0))
+                fixed_return_pct = (fixed_total_pnl / fixed_total_invested) * 100.0 if fixed_total_invested != 0 else np.nan
+                summary.update({
+                    'fixed_total_invested': fixed_total_invested,
+                    'fixed_total_pnl': fixed_total_pnl,
+                    'fixed_return_percent_total': fixed_return_pct,
+                    'fixed_avg_return_percent_per_trade': fixed_return_pct
+                })
+
+        else:
+            summary.update({
+                'after_period_closures_found': len(after_trades),
+                'after_period_closures_included': False,
+                'open_positions_excluded': int(len(remaining_open_positions)) if exclude_incomplete else 0
+            })
+            try:
+                final_equity_baseline = (equity_curve.dropna().iloc[-1] if not equity_curve.dropna().empty else initial_capital)
+                days = (df.index[-1] - df.index[0]).days
+                years = days / 365.25 if days > 0 else 0
+                cagr = ((final_equity_baseline / initial_capital) ** (1 / years) - 1) * 100 if years > 0 else np.nan
+            except Exception:
+                cagr = np.nan
+            try:
+                eq = equity_curve.dropna()
+                returns = eq.pct_change().dropna()
+                if returns.shape[0] > 1 and returns.std() > 0:
+                    deltas = np.diff(df.index.astype('int64')) / 1e9
+                    median_delta = np.median(deltas) if len(deltas) > 0 else 24*3600
+                    if median_delta >= 23 * 3600:
+                        ppy = 252
+                    elif median_delta >= 3600:
+                        ppy = int(252 * 6.5)
+                    else:
+                        ppy = 252
+                    sharpe = (returns.mean() / returns.std()) * np.sqrt(ppy)
+                else:
+                    sharpe = np.nan
+            except Exception:
+                sharpe = np.nan
+            try:
+                eq = equity_curve.dropna()
+                running_max = eq.cummax()
+                drawdown = (eq / running_max - 1)
+                max_drawdown = drawdown.min()
+            except Exception:
+                max_drawdown = np.nan
+            summary.update({
+                'cagr_percent': cagr,
+                'sharpe': sharpe,
+                'max_drawdown': max_drawdown
+            })
+
+        # ensure win_rate present
+        if summary.get('win_rate_percent') is None:
+            try:
+                summary['win_rate_percent'] = float(baseline_summary.get('win_rate_percent', np.nan))
+            except Exception:
+                summary['win_rate_percent'] = None
+
+    # ---- UI output: summary & trades ----
+    st.subheader("תוצאות Backtest")
+    st.write("סיכום כללי:")
+    st.json(summary)
+
+    if debug_mode and debug_log is not None:
+        st.subheader("Debug log — מה קרה בשורות הראשונות")
+        for line in debug_log[:500]:
+            st.text(line)
+
+    # ---- Trades table (closed during period, closed after period, open) ----
+    st.subheader("טבלת עסקאות (נסגרו / נסגרו אחרי התאריך / פתוחות)")
+    if 'combined_rows' not in locals() or len(combined_rows) == 0:
+        st.warning("לא נרשמו עסקאות לפי הפרמטרים שנבחרו.")
+    else:
+        combined_df_display = pd.DataFrame(combined_rows)
+        combined_df_display = combined_df_display[[
+            'entry_date','entry_indicator','entry_price','exit_date','exit_indicator','exit_price','pnl_percent','pnl_amount','days'
+        ]]
+        combined_df_display = combined_df_display.rename(columns={
+            'entry_date': 'תאריך כניסה',
+            'entry_indicator': 'ערך אינדיקטור כניסה',
+            'entry_price': 'מחיר כניסה',
+            'exit_date': 'תאריך יציאה / מצב',
+            'exit_indicator': 'ערך אינדיקטור יציאה',
+            'exit_price': 'מחיר יציאה',
+            'pnl_percent': 'אחוז רווח/הפסד',
+            'pnl_amount': 'רווח/הפסד כספי',
+            'days': 'מספר ימים'
+        })
+        st.dataframe(combined_df_display)
+
+        # CSV downloads
+        if not trades_df.empty:
+            csv = trades_df.to_csv(index=False).encode('utf-8')
+            st.download_button("הורד CSV של עסקאות (נסגרו בתקופת הבדיקה)", data=csv, file_name=f"{ticker}_trades_closed.csv", mime="text/csv")
+        if after_rows:
+            after_csv = pd.DataFrame(after_rows).to_csv(index=False).encode('utf-8')
+            st.download_button("הורד CSV של סגירות לאחר התקופה", data=after_csv, file_name=f"{ticker}_after_period_closures.csv", mime="text/csv")
+        if open_rows:
+            open_csv = pd.DataFrame(open_rows).to_csv(index=False).encode('utf-8')
+            st.download_button("הורד CSV של פוזיציות פתוחות", data=open_csv, file_name=f"{ticker}_open_positions.csv", mime="text/csv")
+
+    # Optionally show a detailed table just for open positions (raw fields)
+    if 'remaining_open_positions' in locals() and remaining_open_positions:
+        st.subheader("פוזיציות שעדיין פתוחות - פרטים")
+        raw_open = []
+        for pos in remaining_open_positions:
+            raw_open.append({
+                'entry_date': pos.get('entry_date'),
+                'entry_indicator': pos.get('entry_indicator'),
+                'entry_price': pos.get('entry_price'),
+                'shares': pos.get('shares'),
+                'invested': pos.get('invested'),
+                'commission_entry': pos.get('commission_entry'),
+                'max_price': pos.get('max_price'),
+                'deferred': pos.get('deferred')
+            })
+        raw_open_df = pd.DataFrame(raw_open)
+        try:
+            raw_open_df['entry_date'] = pd.to_datetime(raw_open_df['entry_date']).dt.strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            pass
+        st.dataframe(raw_open_df)
+
+    # Plot price with markers (including after-period exits and open positions)
+    st.subheader("גרף מחירים - כניסות/יציאות")
+    fig, ax = plt.subplots(figsize=(12,6))
+    ax.plot(df_full.index, df_full['Close'], label=f"{ticker} Close (fetched range)")
+    # closed during period
+    if not trades_df.empty:
+        for _, row in trades_df.iterrows():
+            try:
+                entry_dt = pd.to_datetime(row['entry_date'])
+                exit_dt = pd.to_datetime(row['exit_date'])
+                ax.scatter(entry_dt, row['entry_price'], marker='^', s=80, color='green')
+                ax.scatter(exit_dt, row['exit_price'], marker='v', s=80, color='red')
+            except Exception:
+                pass
+    # after_period closures
+    if 'after_trades' in locals():
+        for at in after_trades:
+            try:
+                entry_dt = pd.to_datetime(at['entry_date'])
+                exit_dt = pd.to_datetime(at['exit_date'])
+                ax.scatter(entry_dt, at['entry_price'], marker='^', s=80, color='green')
+                ax.scatter(exit_dt, at['exit_price'], marker='x', s=100, color='blue', label='Exit after period')
+            except Exception:
+                pass
+    # open positions
+    if 'remaining_open_positions' in locals():
+        for pos in remaining_open_positions:
+            try:
+                entry_dt = pd.to_datetime(pos.get('entry_date'))
+                ax.scatter(entry_dt, pos.get('entry_price'), marker='^', s=120, facecolors='none', edgecolors='orange', linewidths=2, label='Open Position')
+            except Exception:
+                pass
+    ax.set_title(f"{ticker} — Price with Entries/Exits (including post-period data)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.legend()
+    st.pyplot(fig)
+
+    # equity curve (as originally computed for period)
+    st.subheader("עקומת הון (תקופת הבדיקה)")
+    if not equity_curve.dropna().empty:
+        fig2, ax2 = plt.subplots(figsize=(12,4))
+        ax2.plot(equity_curve.index, equity_curve.values, label='Equity Curve (during period)')
+        ax2.set_title('Equity Curve (initial capital + realized + unrealized during period)')
+        ax2.set_xlabel('Date')
+        ax2.set_ylabel('Equity')
+        ax2.legend()
+        st.pyplot(fig2)
+
+    # PNG & PDF downloads
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches='tight')
+    buf.seek(0)
+    st.download_button("הורד PNG של הגרף", data=buf, file_name=f"{ticker}_chart.png", mime="image/png")
+    buf.seek(0)
+
+    pdf_buf = BytesIO()
+    with PdfPages(pdf_buf) as pdf:
+        pdf.savefig(fig, bbox_inches='tight')
+        if 'fig2' in locals():
+            pdf.savefig(fig2, bbox_inches='tight')
+        fig_text = plt.figure(figsize=(8.27, 11.69))
+        plt.axis('off')
+        text = f"Backtest Summary for {ticker}\n\n"
+        try:
+            for k, v in summary.items():
+                text += f"{k}: {v}\n"
+        except Exception:
+            text += "No summary available\n"
+        plt.text(0.01, 0.99, text, va='top', wrap=True, fontsize=12)
+        pdf.savefig(fig_text, bbox_inches='tight')
+        plt.close(fig_text)
+    pdf_buf.seek(0)
+    st.download_button("הורד PDF (גרף + סיכום)", data=pdf_buf, file_name=f"{ticker}_report.pdf", mime="application/pdf")
+
+    # Compare to Buy & Hold
+    if compare_buy_hold:
+        st.subheader("השוואה ל-BUY & HOLD")
+        try:
+            start_price = _to_scalar_safe(df['Close'].iloc[0])
+            end_price = _to_scalar_safe(df['Close'].iloc[-1])
+        except Exception:
+            st.error("לא ניתן להמיר את מחירי הסגירה למחיר סקלרי לצורך השוואת Buy & Hold.")
+            start_price = None
+            end_price = None
+
+        if start_price is None or end_price is None:
+            st.info("אין נתונים להשוואת Buy & Hold.")
+        else:
+            bh_return = ((end_price - start_price) / start_price) * 100.0 if start_price != 0 else np.nan
+            st.write(f"Buy & Hold return for period: {bh_return:.2f}%")
+
+# EOF
