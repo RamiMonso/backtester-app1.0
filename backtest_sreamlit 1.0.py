@@ -1,4 +1,4 @@
-er_streamlit_improved_with_real_indicator.py
+#backstarterer_streamlit_improved_with_real_indicator.py
 # Improved Backtester for Streamlit — expanded warmup + option to use real indicator values/prices
 # להרצה: pip install streamlit yfinance pandas numpy matplotlib
 # ואז: streamlit run backtester_streamlit_improved_with_real_indicator.py
@@ -1402,3 +1402,4 @@ if submitted:
             st.write(f"Buy & Hold return for period: {bh_return:.2f}%")
 
 # EOF
+
